@@ -523,6 +523,7 @@ int main(int argc, char *argv[])
 	};
 	char *pcm_name = "default";
 	int tmp, err, c;
+	int optind_save;
 	int do_device_list = 0, do_pcm_list = 0;
 	snd_pcm_info_t *info;
 	FILE *direction;
@@ -881,6 +882,9 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, signal_handler);
 	signal(SIGABRT, signal_handler);
 	signal(SIGUSR1, signal_handler_recycle);
+
+	optind_save = optind;
+retry:
 	if (interleaved) {
 		if (optind > argc - 1) {
 			if (stream == SND_PCM_STREAM_PLAYBACK)
@@ -903,6 +907,15 @@ int main(int argc, char *argv[])
 	}
 	if (verbose==2)
 		putchar('\n');
+
+	if (!in_aborting) {
+		snd_pcm_drop(handle);
+		snd_pcm_hw_free(handle);
+		/* sleep(1); */
+		optind = optind_save;
+		goto retry;
+	}
+
 	snd_pcm_close(handle);
 	handle = NULL;
 	free(audiobuf);
@@ -1596,7 +1609,7 @@ do { \
 #endif
 
 /* I/O error handler */
-static void xrun(void)
+static int xrun(void)
 {
 	snd_pcm_status_t *status;
 	int res;
@@ -1640,9 +1653,9 @@ static void xrun(void)
 		}
 		if ((res = snd_pcm_prepare(handle))<0) {
 			error(_("xrun: prepare error: %s"), snd_strerror(res));
-			prg_exit(EXIT_FAILURE);
+			return -1;
 		}
-		return;		/* ok, data should be accepted again */
+		return 0;		/* ok, data should be accepted again */
 	} if (snd_pcm_status_get_state(status) == SND_PCM_STATE_DRAINING) {
 		if (verbose) {
 			fprintf(stderr, _("Status(DRAINING):\n"));
@@ -1654,7 +1667,7 @@ static void xrun(void)
 				error(_("xrun(DRAINING): prepare error: %s"), snd_strerror(res));
 				prg_exit(EXIT_FAILURE);
 			}
-			return;
+			return 0;
 		}
 	}
 	if (verbose) {
@@ -2136,7 +2149,8 @@ static ssize_t pcm_read(u_char *data, size_t rcount)
 			if (!test_nowait)
 				snd_pcm_wait(handle, 100);
 		} else if (r == -EPIPE) {
-			xrun();
+			if (xrun() < 0)
+				return -1;
 		} else if (r == -ESTRPIPE) {
 			suspend();
 		} else if (r < 0) {
@@ -3123,6 +3137,7 @@ static void capture(char *orig_name)
 	char namebuf[PATH_MAX+1];
 	off64_t count, rest;		/* number of bytes to capture */
 	struct stat statbuf;
+	int rw_error = 0;
 
 	/* get number of bytes to capture */
 	count = calc_count();
@@ -3196,7 +3211,7 @@ static void capture(char *orig_name)
 				(size_t)rest : chunk_bytes;
 			size_t f = c * 8 / bits_per_frame;
 			if (pcm_read(audiobuf, f) != f) {
-				in_aborting = 1;
+				rw_error = 1;
 				break;
 			}
 			if (xwrite(fd, audiobuf, c) != c) {
@@ -3223,6 +3238,9 @@ static void capture(char *orig_name)
 
 		if (in_aborting)
 			prg_exit(EXIT_FAILURE);
+
+		if (rw_error)
+			break;
 
 		/* repeat the loop when format is raw without timelimit or
 		 * requested counts of data are recorded
